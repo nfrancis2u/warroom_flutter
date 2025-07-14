@@ -8,6 +8,8 @@ import 'package:image_picker/image_picker.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'screens/search_page.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
+import 'screens/bible_lookup_page.dart';
+import 'screens/groups_page.dart';
 
 import 'firebase_options.dart';
 
@@ -213,6 +215,8 @@ class _RegisterPageState extends State<RegisterPage> {
         'profileImageUrl': '',
         'followers': <String>[],
         'following': <String>[],
+        'blockedUsers': <String>[],
+        'blockedBy': <String>[],
         'created_at': FieldValue.serverTimestamp(),
       });
     } on FirebaseAuthException catch (e) {
@@ -256,6 +260,12 @@ class _HomePageState extends State<HomePage> {
         title: const Text('Community Feed'),
         actions: [
           IconButton(
+            icon: const Icon(Icons.groups),
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => const GroupsPage()),
+            ),
+          ),
+          IconButton(
             icon: const Icon(Icons.search),
             onPressed: () => Navigator.of(context).push(
               MaterialPageRoute(builder: (_) => const SearchPage()),
@@ -290,26 +300,36 @@ class PostList extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final currentUser = FirebaseAuth.instance.currentUser;
-    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-      stream: FirebaseFirestore.instance
-          .collection('posts')
-          .orderBy('created_at', descending: true)
-          .snapshots(),
-      builder: (context, snapshot) {
-        if (snapshot.connectionState == ConnectionState.waiting) {
-          return const Center(child: CircularProgressIndicator());
-        }
-        final docs = snapshot.data?.docs ?? [];
-        if (docs.isEmpty) {
-          return const Center(child: Text('No posts yet – be the first!'));
-        }
-        return ListView.builder(
-          itemCount: docs.length,
-          itemBuilder: (_, i) {
-            return PostTile(
-              postId: docs[i].id,
-              data: docs[i].data(),
-              currentUserId: currentUser?.uid,
+    if (currentUser == null) {
+      return const Center(child: Text('Not signed in'));
+    }
+    return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+      stream: FirebaseFirestore.instance.collection('users').doc(currentUser.uid).snapshots(),
+      builder: (context, userSnap) {
+        if (!userSnap.hasData) return const Center(child: CircularProgressIndicator());
+        final blocked = List<String>.from(userSnap.data!.data()?['blockedUsers'] ?? []);
+        return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+          stream: FirebaseFirestore.instance
+              .collection('posts')
+              .orderBy('created_at', descending: true)
+              .snapshots(),
+          builder: (context, snapshot) {
+            if (snapshot.connectionState == ConnectionState.waiting) {
+              return const Center(child: CircularProgressIndicator());
+            }
+            final docs = snapshot.data?.docs.where((d) => !blocked.contains(d['authorId'])).toList() ?? [];
+            if (docs.isEmpty) {
+              return const Center(child: Text('No posts to display'));
+            }
+            return ListView.builder(
+              itemCount: docs.length,
+              itemBuilder: (_, i) {
+                return PostTile(
+                  postId: docs[i].id,
+                  data: docs[i].data(),
+                  currentUserId: currentUser.uid,
+                );
+              },
             );
           },
         );
@@ -382,11 +402,23 @@ class _PostTileState extends State<PostTile> {
                     onPressed: likeBusy ? null : _toggleLike,
                   ),
                   Text(likes.length.toString()),
+                  if (widget.data['type'] == 'Prayer Request') ...[
+                    IconButton(
+                      icon: const Icon(Icons.volunteer_activism),
+                      onPressed: _togglePrayed,
+                    ),
+                    Text(List<String>.from(widget.data['prayedBy'] ?? []).length.toString()),
+                  ],
                   IconButton(
                     icon: const Icon(Icons.comment_outlined),
                     onPressed: () => Navigator.of(context).push(
                       MaterialPageRoute(builder: (_) => PostDetailPage(postId: widget.postId)),
                     ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.report_gmailerrorred),
+                    onPressed: _reportPost,
+                    tooltip: 'Report',
                   ),
                 ],
               )
@@ -417,6 +449,39 @@ class _PostTileState extends State<PostTile> {
       });
     }
     setState(() => likeBusy = false);
+  }
+
+  Future<void> _togglePrayed() async {
+    if (widget.currentUserId == null) return;
+    setState(() => likeBusy = true);
+    final docRef = FirebaseFirestore.instance.collection('posts').doc(widget.postId);
+    final isPrayed = (widget.data['prayedBy'] ?? []).contains(widget.currentUserId);
+    await docRef.update({
+      'prayedBy': isPrayed
+          ? FieldValue.arrayRemove([widget.currentUserId])
+          : FieldValue.arrayUnion([widget.currentUserId]),
+    });
+    // notify author if prayed
+    if (!isPrayed && widget.data['authorId'] != null && widget.data['authorId'] != widget.currentUserId) {
+      await FirebaseFirestore.instance.collection('users').doc(widget.data['authorId']).collection('notifications').add({
+        'type': 'prayed',
+        'fromUserId': widget.currentUserId,
+        'postId': widget.postId,
+        'created_at': FieldValue.serverTimestamp(),
+      });
+    }
+    setState(() => likeBusy = false);
+  }
+
+  Future<void> _reportPost() async {
+    final userId = widget.currentUserId;
+    if (userId == null) return;
+    await FirebaseFirestore.instance.collection('reports').add({
+      'postId': widget.postId,
+      'reportedBy': userId,
+      'created_at': FieldValue.serverTimestamp(),
+    });
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Reported. Thank you.')));
   }
 }
 
@@ -485,6 +550,22 @@ class _NewPostPageState extends State<NewPostPage> {
                 label: const Text('Add image'),
               ),
             ),
+            if (_selectedType == 'Bible Verse')
+              Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton.icon(
+                  icon: const Icon(Icons.book),
+                  label: const Text('Lookup verse'),
+                  onPressed: () async {
+                    final verse = await Navigator.of(context).push<String>(
+                      MaterialPageRoute(builder: (_) => const BibleLookupPage()),
+                    );
+                    if (verse != null && verse.isNotEmpty) {
+                      ctrl.text = verse;
+                    }
+                  },
+                ),
+              ),
             TextField(
               controller: ctrl,
               maxLines: 6,
@@ -539,6 +620,7 @@ class _NewPostPageState extends State<NewPostPage> {
       'type': _selectedType,
       'imageUrl': imageUrl ?? '',
       'likes': <String>[],
+      'prayedBy': <String>[],
     });
     if (mounted) {
       setState(() => loading = false);
@@ -635,9 +717,19 @@ class _ProfilePageState extends State<ProfilePage> {
                       if (!snap.hasData) return const SizedBox();
                       final following = List<String>.from(snap.data!.data()?['following'] ?? []);
                       final isFollowing = following.contains(uid);
-                      return ElevatedButton(
-                        onPressed: () => _toggleFollow(currentUser.uid, uid, isFollowing),
-                        child: Text(isFollowing ? 'Unfollow' : 'Follow'),
+                      return Column(
+                        children: [
+                          ElevatedButton(
+                            onPressed: () => _toggleFollow(currentUser.uid, uid, isFollowing),
+                            child: Text(isFollowing ? 'Unfollow' : 'Follow'),
+                          ),
+                          const SizedBox(height: 8),
+                          ElevatedButton(
+                            onPressed: () => _blockUser(currentUser.uid, uid),
+                            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+                            child: const Text('Block'),
+                          ),
+                        ],
                       );
                     },
                   ),
@@ -663,6 +755,15 @@ class _ProfilePageState extends State<ProfilePage> {
     });
     await FirebaseFirestore.instance.collection('users').doc(target).update({
       'followers': isFollowing ? FieldValue.arrayRemove([me]) : FieldValue.arrayUnion([me]),
+    });
+  }
+
+  Future<void> _blockUser(String me, String target) async {
+    await FirebaseFirestore.instance.collection('users').doc(me).update({
+      'blockedUsers': FieldValue.arrayUnion([target]),
+    });
+    await FirebaseFirestore.instance.collection('users').doc(target).update({
+      'blockedBy': FieldValue.arrayUnion([me]),
     });
   }
 
