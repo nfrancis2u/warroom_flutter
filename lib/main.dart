@@ -1,8 +1,11 @@
+import 'dart:io';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:firebase_storage/firebase_storage.dart';
 
 import 'firebase_options.dart';
 
@@ -195,10 +198,19 @@ class _RegisterPageState extends State<RegisterPage> {
       error = null;
     });
     try {
-      await FirebaseAuth.instance.createUserWithEmailAndPassword(
+      final cred = await FirebaseAuth.instance.createUserWithEmailAndPassword(
         email: emailCtrl.text.trim(),
         password: pwdCtrl.text.trim(),
       );
+      final user = cred.user!;
+      await FirebaseFirestore.instance.collection('users').doc(user.uid).set({
+        'email': user.email,
+        'displayName': '',
+        'denomination': '',
+        'favoriteScripture': '',
+        'profileImageUrl': '',
+        'created_at': FieldValue.serverTimestamp(),
+      });
     } on FirebaseAuthException catch (e) {
       setState(() => error = e.message);
     } finally {
@@ -225,6 +237,13 @@ class HomePage extends StatelessWidget {
             tooltip: 'New post',
           ),
           IconButton(
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => const ProfilePage()),
+            ),
+            icon: const Icon(Icons.person),
+            tooltip: 'Profile',
+          ),
+          IconButton(
             onPressed: () => FirebaseAuth.instance.signOut(),
             icon: const Icon(Icons.logout),
             tooltip: 'Logout',
@@ -241,6 +260,7 @@ class PostList extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final currentUser = FirebaseAuth.instance.currentUser;
     return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
       stream: FirebaseFirestore.instance
           .collection('posts')
@@ -257,11 +277,10 @@ class PostList extends StatelessWidget {
         return ListView.builder(
           itemCount: docs.length,
           itemBuilder: (_, i) {
-            final data = docs[i].data();
             return PostTile(
-              content: data['content'] ?? '',
-              author: data['author'] ?? 'Anonymous',
-              createdAt: (data['created_at'] as Timestamp).toDate(),
+              postId: docs[i].id,
+              data: docs[i].data(),
+              currentUserId: currentUser?.uid,
             );
           },
         );
@@ -270,45 +289,95 @@ class PostList extends StatelessWidget {
   }
 }
 
-class PostTile extends StatelessWidget {
-  final String content;
-  final String author;
-  final DateTime createdAt;
-  const PostTile({super.key, required this.content, required this.author, required this.createdAt});
+class PostTile extends StatefulWidget {
+  final String postId;
+  final Map<String, dynamic> data;
+  final String? currentUserId;
+  const PostTile({super.key, required this.postId, required this.data, this.currentUserId});
+
+  @override
+  State<PostTile> createState() => _PostTileState();
+}
+
+class _PostTileState extends State<PostTile> {
+  bool likeBusy = false;
 
   @override
   Widget build(BuildContext context) {
+    final likes = List<String>.from(widget.data['likes'] ?? []);
+    final isLiked = widget.currentUserId != null && likes.contains(widget.currentUserId);
+    final createdAtTs = widget.data['created_at'] as Timestamp?;
+    final createdAt = createdAtTs?.toDate();
+
     return Card(
       margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(content, style: Theme.of(context).textTheme.bodyLarge),
-            const SizedBox(height: 12),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Text('— $author', style: Theme.of(context).textTheme.bodySmall),
-                Text(
-                  _formatDate(createdAt),
-                  style: Theme.of(context).textTheme.bodySmall,
+      child: InkWell(
+        onTap: () => Navigator.of(context).push(
+          MaterialPageRoute(builder: (_) => PostDetailPage(postId: widget.postId)),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (widget.data['type'] != null)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 8.0),
+                  child: Chip(label: Text(widget.data['type'])),
                 ),
-              ],
-            ),
-          ],
+              if (widget.data['imageUrl'] != null && widget.data['imageUrl'] != '')
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 8.0),
+                  child: Image.network(widget.data['imageUrl'], fit: BoxFit.cover),
+                ),
+              Text(widget.data['content'] ?? '', style: Theme.of(context).textTheme.bodyLarge),
+              const SizedBox(height: 12),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Expanded(child: Text('— ${widget.data['authorName'] ?? 'Anonymous'}')),
+                  if (createdAt != null)
+                    Text('${createdAt.day}/${createdAt.month}/${createdAt.year}', style: Theme.of(context).textTheme.bodySmall),
+                ],
+              ),
+              const Divider(),
+              Row(
+                children: [
+                  IconButton(
+                    icon: Icon(isLiked ? Icons.favorite : Icons.favorite_border, color: isLiked ? Colors.red : null),
+                    onPressed: likeBusy ? null : _toggleLike,
+                  ),
+                  Text(likes.length.toString()),
+                  IconButton(
+                    icon: const Icon(Icons.comment_outlined),
+                    onPressed: () => Navigator.of(context).push(
+                      MaterialPageRoute(builder: (_) => PostDetailPage(postId: widget.postId)),
+                    ),
+                  ),
+                ],
+              )
+            ],
+          ),
         ),
       ),
     );
   }
 
-  String _formatDate(DateTime dt) {
-    return '${dt.day}/${dt.month}/${dt.year}';
+  Future<void> _toggleLike() async {
+    if (widget.currentUserId == null) return;
+    setState(() => likeBusy = true);
+    final docRef = FirebaseFirestore.instance.collection('posts').doc(widget.postId);
+    final isLiked = (widget.data['likes'] ?? []).contains(widget.currentUserId);
+    await docRef.update({
+      'likes': isLiked
+          ? FieldValue.arrayRemove([widget.currentUserId])
+          : FieldValue.arrayUnion([widget.currentUserId]),
+    });
+    setState(() => likeBusy = false);
   }
 }
 
-// ------------------------------ NEW POST ------------------------------ //
+// ------------------------------ NEW POST (with type & image) ------------------------------ //
 class NewPostPage extends StatefulWidget {
   static const routeName = '/new-post';
   const NewPostPage({super.key});
@@ -320,6 +389,11 @@ class NewPostPage extends StatefulWidget {
 class _NewPostPageState extends State<NewPostPage> {
   final ctrl = TextEditingController();
   bool loading = false;
+  String _selectedType = 'Prayer Request';
+  File? _pickedImage;
+  final picker = ImagePicker();
+
+  final postTypes = const ['Prayer Request', 'Testimony', 'Bible Verse'];
 
   @override
   void dispose() {
@@ -327,19 +401,52 @@ class _NewPostPageState extends State<NewPostPage> {
     super.dispose();
   }
 
+  Future<void> _pickImage() async {
+    final picked = await picker.pickImage(source: ImageSource.gallery, maxWidth: 1200);
+    if (picked != null) {
+      setState(() => _pickedImage = File(picked.path));
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('Share a post')),
-      body: Padding(
+      body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
         child: Column(
           children: [
+            DropdownButtonFormField<String>(
+              value: _selectedType,
+              items: postTypes.map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(),
+              onChanged: (v) => setState(() => _selectedType = v!),
+              decoration: const InputDecoration(labelText: 'Post type'),
+            ),
+            const SizedBox(height: 12),
+            if (_pickedImage != null)
+              Stack(
+                alignment: Alignment.topRight,
+                children: [
+                  Image.file(_pickedImage!, height: 180),
+                  IconButton(
+                    icon: const Icon(Icons.close),
+                    onPressed: () => setState(() => _pickedImage = null),
+                  ),
+                ],
+              ),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton.icon(
+                onPressed: _pickImage,
+                icon: const Icon(Icons.photo),
+                label: const Text('Add image'),
+              ),
+            ),
             TextField(
               controller: ctrl,
               maxLines: 6,
               decoration: const InputDecoration(
-                hintText: 'What's on your heart today?',
+                hintText: "What's on your heart today?",
                 border: OutlineInputBorder(),
               ),
             ),
@@ -358,17 +465,253 @@ class _NewPostPageState extends State<NewPostPage> {
 
   Future<void> _submit() async {
     final content = ctrl.text.trim();
-    if (content.isEmpty) return;
+    if (content.isEmpty && _pickedImage == null) return;
     setState(() => loading = true);
+
     final user = FirebaseAuth.instance.currentUser!;
+
+    String authorName = user.email ?? 'Anonymous';
+    final profileDoc = await FirebaseFirestore.instance.collection('users').doc(user.uid).get();
+    if (profileDoc.exists) {
+      authorName = profileDoc.data()?['displayName'] ?? authorName;
+    }
+
+    String? imageUrl;
+    if (_pickedImage != null) {
+      final fileName = '${DateTime.now().millisecondsSinceEpoch}_${user.uid}.jpg';
+      final ref = FirebaseStorage.instance.ref().child('post_images/$fileName');
+      await ref.putFile(_pickedImage!);
+      imageUrl = await ref.getDownloadURL();
+    }
+
     await FirebaseFirestore.instance.collection('posts').add({
       'content': content,
-      'author': user.email ?? 'Anonymous',
+      'authorId': user.uid,
+      'authorName': authorName,
       'created_at': FieldValue.serverTimestamp(),
+      'type': _selectedType,
+      'imageUrl': imageUrl ?? '',
+      'likes': <String>[],
     });
     if (mounted) {
       setState(() => loading = false);
       Navigator.of(context).pop();
     }
+  }
+}
+
+// ------------------------------ PROFILE ------------------------------ //
+class ProfilePage extends StatefulWidget {
+  const ProfilePage({super.key});
+
+  @override
+  State<ProfilePage> createState() => _ProfilePageState();
+}
+
+class _ProfilePageState extends State<ProfilePage> {
+  final displayCtrl = TextEditingController();
+  final denomCtrl = TextEditingController();
+  final verseCtrl = TextEditingController();
+  bool loading = false;
+  File? _photo;
+  final picker = ImagePicker();
+
+  @override
+  void dispose() {
+    displayCtrl.dispose();
+    denomCtrl.dispose();
+    verseCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _pickPhoto() async {
+    final picked = await picker.pickImage(source: ImageSource.gallery, maxWidth: 512);
+    if (picked != null) setState(() => _photo = File(picked.path));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final user = FirebaseAuth.instance.currentUser!;
+    return Scaffold(
+      appBar: AppBar(title: const Text('My Profile')),
+      body: StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+        stream: FirebaseFirestore.instance.collection('users').doc(user.uid).snapshots(),
+        builder: (context, snapshot) {
+          if (!snapshot.hasData) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          final data = snapshot.data!.data() ?? {};
+          displayCtrl.text = data['displayName'] ?? '';
+          denomCtrl.text = data['denomination'] ?? '';
+          verseCtrl.text = data['favoriteScripture'] ?? '';
+          final imageUrl = data['profileImageUrl'] as String?;
+
+          return SingleChildScrollView(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              children: [
+                GestureDetector(
+                  onTap: _pickPhoto,
+                  child: CircleAvatar(
+                    radius: 50,
+                    backgroundImage: _photo != null
+                        ? FileImage(_photo!)
+                        : (imageUrl != null && imageUrl.isNotEmpty)
+                            ? NetworkImage(imageUrl) as ImageProvider
+                            : null,
+                    child: _photo == null && (imageUrl == null || imageUrl.isEmpty)
+                        ? const Icon(Icons.camera_alt, size: 40)
+                        : null,
+                  ),
+                ),
+                const SizedBox(height: 20),
+                TextField(
+                  controller: displayCtrl,
+                  decoration: const InputDecoration(labelText: 'Display name'),
+                ),
+                TextField(
+                  controller: denomCtrl,
+                  decoration: const InputDecoration(labelText: 'Denomination'),
+                ),
+                TextField(
+                  controller: verseCtrl,
+                  decoration: const InputDecoration(labelText: 'Favorite scripture'),
+                ),
+                const SizedBox(height: 20),
+                ElevatedButton(
+                  onPressed: loading ? null : () => _save(user.uid),
+                  child: loading
+                      ? const CircularProgressIndicator.adaptive()
+                      : const Text('Save changes'),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Future<void> _save(String uid) async {
+    setState(() => loading = true);
+    String? downloadUrl;
+    if (_photo != null) {
+      final ref = FirebaseStorage.instance.ref().child('profile_photos/$uid.jpg');
+      await ref.putFile(_photo!);
+      downloadUrl = await ref.getDownloadURL();
+    }
+    await FirebaseFirestore.instance.collection('users').doc(uid).update({
+      'displayName': displayCtrl.text.trim(),
+      'denomination': denomCtrl.text.trim(),
+      'favoriteScripture': verseCtrl.text.trim(),
+      if (downloadUrl != null) 'profileImageUrl': downloadUrl,
+    });
+    if (mounted) setState(() => loading = false);
+  }
+}
+
+// ------------------------------ POST DETAIL (comments) ------------------------------ //
+class PostDetailPage extends StatefulWidget {
+  final String postId;
+  const PostDetailPage({super.key, required this.postId});
+
+  @override
+  State<PostDetailPage> createState() => _PostDetailPageState();
+}
+
+class _PostDetailPageState extends State<PostDetailPage> {
+  final commentCtrl = TextEditingController();
+  bool sending = false;
+
+  @override
+  void dispose() {
+    commentCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _sendComment() async {
+    final user = FirebaseAuth.instance.currentUser!;
+    final content = commentCtrl.text.trim();
+    if (content.isEmpty) return;
+    setState(() => sending = true);
+
+    String authorName = user.email ?? 'Anonymous';
+    final profileDoc = await FirebaseFirestore.instance.collection('users').doc(user.uid).get();
+    if (profileDoc.exists) {
+      authorName = profileDoc.data()?['displayName'] ?? authorName;
+    }
+
+    await FirebaseFirestore.instance
+        .collection('posts')
+        .doc(widget.postId)
+        .collection('comments')
+        .add({
+      'content': content,
+      'authorId': user.uid,
+      'authorName': authorName,
+      'created_at': FieldValue.serverTimestamp(),
+    });
+    commentCtrl.clear();
+    if (mounted) setState(() => sending = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Post')),      
+      body: Column(
+        children: [
+          Expanded(
+            child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+              stream: FirebaseFirestore.instance
+                  .collection('posts')
+                  .doc(widget.postId)
+                  .collection('comments')
+                  .orderBy('created_at', descending: true)
+                  .snapshots(),
+              builder: (context, snapshot) {
+                if (snapshot.connectionState == ConnectionState.waiting) {
+                  return const Center(child: CircularProgressIndicator());
+                }
+                final docs = snapshot.data?.docs ?? [];
+                if (docs.isEmpty) {
+                  return const Center(child: Text('No comments yet'));
+                }
+                return ListView.builder(
+                  reverse: true,
+                  itemCount: docs.length,
+                  itemBuilder: (_, i) {
+                    final data = docs[i].data();
+                    final ts = data['created_at'] as Timestamp?;
+                    final dt = ts?.toDate();
+                    return ListTile(
+                      title: Text(data['content'] ?? ''),
+                      subtitle: Text('${data['authorName'] ?? ''} · ${dt != null ? '${dt.day}/${dt.month}/${dt.year}' : ''}'),
+                    );
+                  },
+                );
+              },
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.all(8.0),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: commentCtrl,
+                    decoration: const InputDecoration(hintText: 'Add a comment…'),
+                  ),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.send),
+                  onPressed: sending ? null : _sendComment,
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }

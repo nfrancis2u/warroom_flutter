@@ -17,6 +17,10 @@ dependencies:
   firebase_core: ^2.24.2
   firebase_auth: ^4.16.3
   cloud_firestore: ^4.13.5
+  
+  # Firebase Storage & image picker
+  firebase_storage: ^11.6.6
+  image_picker: ^1.0.4
 
   # State-management / helpers
   provider: ^6.1.1
