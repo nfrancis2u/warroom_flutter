@@ -1,0 +1,32 @@
+name: christian_social_app
+description: >
+  A Christian social media application built with Flutter for Android and the Web.
+# Prevent accidental publishing to pub.dev.
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ">=2.17.0 <3.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Firebase
+  firebase_core: ^2.24.2
+  firebase_auth: ^4.16.3
+  cloud_firestore: ^4.13.5
+
+  # State-management / helpers
+  provider: ^6.1.1
+  flutterfire_ui: ^0.4.3+18
+  intl: ^0.18.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^2.0.3
+
+flutter:
+  uses-material-design: true
