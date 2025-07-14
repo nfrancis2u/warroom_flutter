@@ -6,6 +6,8 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:firebase_storage/firebase_storage.dart';
+import 'screens/search_page.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
 
 import 'firebase_options.dart';
 
@@ -209,6 +211,8 @@ class _RegisterPageState extends State<RegisterPage> {
         'denomination': '',
         'favoriteScripture': '',
         'profileImageUrl': '',
+        'followers': <String>[],
+        'following': <String>[],
         'created_at': FieldValue.serverTimestamp(),
       });
     } on FirebaseAuthException catch (e) {
@@ -222,8 +226,28 @@ class _RegisterPageState extends State<RegisterPage> {
 }
 
 // ------------------------------ HOME FEED ------------------------------ //
-class HomePage extends StatelessWidget {
+class HomePage extends StatefulWidget {
   const HomePage({super.key});
+
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> {
+  @override
+  void initState() {
+    super.initState();
+    _setupPushToken();
+  }
+
+  Future<void> _setupPushToken() async {
+    await FirebaseMessaging.instance.requestPermission();
+    final token = await FirebaseMessaging.instance.getToken();
+    final user = FirebaseAuth.instance.currentUser;
+    if (token != null && user != null) {
+      await FirebaseFirestore.instance.collection('users').doc(user.uid).update({'fcmToken': token});
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -231,6 +255,12 @@ class HomePage extends StatelessWidget {
       appBar: AppBar(
         title: const Text('Community Feed'),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.search),
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => const SearchPage()),
+            ),
+          ),
           IconButton(
             onPressed: () => Navigator.of(context).pushNamed(NewPostPage.routeName),
             icon: const Icon(Icons.add),
@@ -246,7 +276,6 @@ class HomePage extends StatelessWidget {
           IconButton(
             onPressed: () => FirebaseAuth.instance.signOut(),
             icon: const Icon(Icons.logout),
-            tooltip: 'Logout',
           ),
         ],
       ),
@@ -335,7 +364,12 @@ class _PostTileState extends State<PostTile> {
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  Expanded(child: Text('— ${widget.data['authorName'] ?? 'Anonymous'}')),
+                  Expanded(child: GestureDetector(
+                    child: Text('— ${widget.data['authorName'] ?? 'Anonymous'}', style: const TextStyle(decoration: TextDecoration.underline)),
+                    onTap: () => Navigator.of(context).push(
+                      MaterialPageRoute(builder: (_) => ProfilePage(userId: widget.data['authorId'])),
+                    ),
+                  )),
                   if (createdAt != null)
                     Text('${createdAt.day}/${createdAt.month}/${createdAt.year}', style: Theme.of(context).textTheme.bodySmall),
                 ],
@@ -373,6 +407,15 @@ class _PostTileState extends State<PostTile> {
           ? FieldValue.arrayRemove([widget.currentUserId])
           : FieldValue.arrayUnion([widget.currentUserId]),
     });
+    // notify author if liked
+    if (!isLiked && widget.data['authorId'] != null && widget.data['authorId'] != widget.currentUserId) {
+      await FirebaseFirestore.instance.collection('users').doc(widget.data['authorId']).collection('notifications').add({
+        'type': 'like',
+        'fromUserId': widget.currentUserId,
+        'postId': widget.postId,
+        'created_at': FieldValue.serverTimestamp(),
+      });
+    }
     setState(() => likeBusy = false);
   }
 }
@@ -466,6 +509,10 @@ class _NewPostPageState extends State<NewPostPage> {
   Future<void> _submit() async {
     final content = ctrl.text.trim();
     if (content.isEmpty && _pickedImage == null) return;
+    if (containsBannedWords(content)) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Content contains inappropriate words.')));
+      return;
+    }
     setState(() => loading = true);
 
     final user = FirebaseAuth.instance.currentUser!;
@@ -502,7 +549,8 @@ class _NewPostPageState extends State<NewPostPage> {
 
 // ------------------------------ PROFILE ------------------------------ //
 class ProfilePage extends StatefulWidget {
-  const ProfilePage({super.key});
+  final String? userId;
+  const ProfilePage({super.key, this.userId});
 
   @override
   State<ProfilePage> createState() => _ProfilePageState();
@@ -531,11 +579,13 @@ class _ProfilePageState extends State<ProfilePage> {
 
   @override
   Widget build(BuildContext context) {
-    final user = FirebaseAuth.instance.currentUser!;
+    final currentUser = FirebaseAuth.instance.currentUser!;
+    final uid = widget.userId ?? currentUser.uid;
+    final isOwn = uid == currentUser.uid;
     return Scaffold(
-      appBar: AppBar(title: const Text('My Profile')),
+      appBar: AppBar(title: Text(isOwn ? 'My Profile' : 'Profile')),
       body: StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-        stream: FirebaseFirestore.instance.collection('users').doc(user.uid).snapshots(),
+        stream: FirebaseFirestore.instance.collection('users').doc(uid).snapshots(),
         builder: (context, snapshot) {
           if (!snapshot.hasData) {
             return const Center(child: CircularProgressIndicator());
@@ -578,18 +628,42 @@ class _ProfilePageState extends State<ProfilePage> {
                   decoration: const InputDecoration(labelText: 'Favorite scripture'),
                 ),
                 const SizedBox(height: 20),
-                ElevatedButton(
-                  onPressed: loading ? null : () => _save(user.uid),
-                  child: loading
-                      ? const CircularProgressIndicator.adaptive()
-                      : const Text('Save changes'),
-                ),
+                if (!isOwn)
+                  FutureBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+                    future: FirebaseFirestore.instance.collection('users').doc(currentUser.uid).get(),
+                    builder: (context, snap) {
+                      if (!snap.hasData) return const SizedBox();
+                      final following = List<String>.from(snap.data!.data()?['following'] ?? []);
+                      final isFollowing = following.contains(uid);
+                      return ElevatedButton(
+                        onPressed: () => _toggleFollow(currentUser.uid, uid, isFollowing),
+                        child: Text(isFollowing ? 'Unfollow' : 'Follow'),
+                      );
+                    },
+                  ),
+                if (isOwn) ...[
+                  ElevatedButton(
+                    onPressed: loading ? null : () => _save(uid),
+                    child: loading
+                        ? const CircularProgressIndicator.adaptive()
+                        : const Text('Save changes'),
+                  ),
+                ],
               ],
             ),
           );
         },
       ),
     );
+  }
+
+  Future<void> _toggleFollow(String me, String target, bool isFollowing) async {
+    await FirebaseFirestore.instance.collection('users').doc(me).update({
+      'following': isFollowing ? FieldValue.arrayRemove([target]) : FieldValue.arrayUnion([target]),
+    });
+    await FirebaseFirestore.instance.collection('users').doc(target).update({
+      'followers': isFollowing ? FieldValue.arrayRemove([me]) : FieldValue.arrayUnion([me]),
+    });
   }
 
   Future<void> _save(String uid) async {
@@ -633,6 +707,10 @@ class _PostDetailPageState extends State<PostDetailPage> {
     final user = FirebaseAuth.instance.currentUser!;
     final content = commentCtrl.text.trim();
     if (content.isEmpty) return;
+    if (containsBannedWords(content)) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Comment contains inappropriate words.')));
+      return;
+    }
     setState(() => sending = true);
 
     String authorName = user.email ?? 'Anonymous';
@@ -651,6 +729,17 @@ class _PostDetailPageState extends State<PostDetailPage> {
       'authorName': authorName,
       'created_at': FieldValue.serverTimestamp(),
     });
+    // notify post author
+    final postDoc = await FirebaseFirestore.instance.collection('posts').doc(widget.postId).get();
+    final postAuthorId = postDoc.data()?['authorId'];
+    if (postAuthorId != user.uid) {
+      await FirebaseFirestore.instance.collection('users').doc(postAuthorId).collection('notifications').add({
+        'type': 'comment',
+        'fromUserId': user.uid,
+        'postId': widget.postId,
+        'created_at': FieldValue.serverTimestamp(),
+      });
+    }
     commentCtrl.clear();
     if (mounted) setState(() => sending = false);
   }
@@ -715,3 +804,6 @@ class _PostDetailPageState extends State<PostDetailPage> {
     );
   }
 }
+
+const bannedWords = ['badword1', 'badword2'];
+bool containsBannedWords(String text) => bannedWords.any((w) => text.toLowerCase().contains(w));

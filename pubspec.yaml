@@ -21,6 +21,7 @@ dependencies:
   # Firebase Storage & image picker
   firebase_storage: ^11.6.6
   image_picker: ^1.0.4
+  firebase_messaging: ^14.7.10
 
   # State-management / helpers
   provider: ^6.1.1
